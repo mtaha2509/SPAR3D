@@ -919,3 +919,144 @@ class SPAR3D(BaseModule):
                     rets.append(tmesh)
 
         return rets, global_dict
+
+    def run_multiview_image(
+        self,
+        images: List[Image.Image],
+        bake_resolution: int,
+        pointcloud: Optional[Union[List[np.ndarray], np.ndarray, Tensor]] = None,
+        remesh: Literal["none", "triangle", "quad"] = "none",
+        vertex_count: int = -1,
+        estimate_illumination: bool = False,
+        return_points: bool = False,
+    ) -> Tuple[Union[trimesh.Trimesh, List[trimesh.Trimesh]], dict[str, Any]]:
+        """Process multiple views of the same object to create a 3D mesh.
+        
+        Unlike run_image which processes multiple images independently,
+        this method treats the images as different views of the same object.
+        
+        Args:
+            images: List of input images from different viewpoints
+            bake_resolution: Resolution for texture baking
+            pointcloud: Optional initial pointcloud
+            remesh: Remeshing option
+            vertex_count: Target vertex count for remeshing
+            estimate_illumination: Whether to estimate illumination
+            return_points: Whether to return the point cloud
+            
+        Returns:
+            A tuple of (mesh, global_dict)
+        """
+        # Initialize containers for inputs
+        rgb_cond = []
+        mask_cond = []
+        
+        # Process each input image
+        for img in images:
+            mask, rgb = self.prepare_image(img)
+            mask_cond.append(mask)
+            rgb_cond.append(rgb)
+        
+        # Stack all images as different views of the same object
+        rgb_cond = torch.stack(rgb_cond, 0)  # [num_views, H, W, 3]
+        mask_cond = torch.stack(mask_cond, 0)  # [num_views, H, W, 1]
+        
+        # Create a batch of size 1 (single object) with multiple views
+        rgb_cond = rgb_cond.unsqueeze(0)  # [1, num_views, H, W, 3]
+        mask_cond = mask_cond.unsqueeze(0)  # [1, num_views, H, W, 1]
+        
+        # Create camera parameters for each view
+        # For now, we'll use estimated cameras based on evenly distributed viewpoints
+        num_views = len(images)
+        c2w_cond = self._create_multiview_cameras(num_views)
+        
+        intrinsic, intrinsic_normed_cond = create_intrinsic_from_fov_rad(
+            self.cfg.default_fovy_rad,
+            self.cfg.cond_image_size,
+            self.cfg.cond_image_size,
+        )
+        
+        batch = {
+            "rgb_cond": rgb_cond,
+            "mask_cond": mask_cond,
+            "c2w_cond": c2w_cond,
+            "intrinsic_cond": intrinsic.to(self.device).view(1, 1, 3, 3).repeat(1, num_views, 1, 1),
+            "intrinsic_normed_cond": intrinsic_normed_cond.to(self.device).view(1, 1, 3, 3).repeat(1, num_views, 1, 1),
+        }
+        
+        meshes, global_dict = self.generate_mesh(
+            batch,
+            bake_resolution,
+            pointcloud,
+            remesh,
+            vertex_count,
+            estimate_illumination,
+        )
+        
+        if return_points:
+            point_clouds = []
+            xyz = batch["pc_cond"][0, :, :3].cpu().numpy()
+            color_rgb = (batch["pc_cond"][0, :, 3:6] * 255).cpu().numpy().astype(np.uint8)
+            pc_trimesh = trimesh.PointCloud(vertices=xyz, colors=color_rgb)
+            point_clouds.append(pc_trimesh)
+            global_dict["point_clouds"] = point_clouds
+        
+        return meshes[0], global_dict
+        
+    def _create_multiview_cameras(self, num_views: int) -> torch.Tensor:
+        """Create camera matrices for multiple viewpoints around the object.
+        
+        Args:
+            num_views: Number of camera viewpoints to create
+            
+        Returns:
+            Tensor of camera matrices with shape [1, num_views, 4, 4]
+        """
+        # Create evenly distributed viewpoints around the object
+        c2w_list = []
+        
+        # Base camera distance
+        distance = self.cfg.default_distance
+        
+        for i in range(num_views):
+            # Calculate angle for this view (evenly distributed around a circle)
+            theta = 2 * np.pi * i / num_views
+            
+            # Calculate camera position
+            x = distance * np.sin(theta)
+            z = distance * np.cos(theta)
+            y = 0.0  # Keep camera at same height
+            
+            # Create camera matrix (looking at origin)
+            c2w = torch.eye(4, dtype=torch.float32, device=self.device)
+            
+            # Set camera position
+            c2w[0, 3] = x
+            c2w[1, 3] = y
+            c2w[2, 3] = z
+            
+            # Make camera look at origin
+            # This is a simplified version - a proper implementation would calculate
+            # the full camera-to-world matrix with appropriate rotation
+            look_at = torch.tensor([0, 0, 0], dtype=torch.float32, device=self.device)
+            up = torch.tensor([0, 1, 0], dtype=torch.float32, device=self.device)
+            
+            # Camera position
+            cam_pos = c2w[:3, 3]
+            
+            # Calculate camera axes
+            z_axis = F.normalize(cam_pos - look_at, dim=0)  # Forward
+            x_axis = F.normalize(torch.cross(up, z_axis), dim=0)  # Right
+            y_axis = torch.cross(z_axis, x_axis)  # Up
+            
+            # Set rotation part of the matrix
+            c2w[:3, 0] = x_axis
+            c2w[:3, 1] = y_axis
+            c2w[:3, 2] = z_axis
+            
+            c2w_list.append(c2w)
+        
+        # Stack cameras for all views
+        c2w_cond = torch.stack(c2w_list, dim=0).unsqueeze(0)  # [1, num_views, 4, 4]
+        
+        return c2w_cond
