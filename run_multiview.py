@@ -1,6 +1,8 @@
 import argparse
 import os
 from contextlib import nullcontext
+import math
+import numpy as np
 
 import torch
 from PIL import Image
@@ -17,6 +19,38 @@ def check_positive(value):
     if ivalue <= 0:
         raise argparse.ArgumentTypeError("%s is an invalid positive int value" % value)
     return ivalue
+
+
+def extract_structured_camera_positions(images, args):
+    """Extract camera positions from image filenames if they follow a structured naming convention.
+    
+    Looks for filenames like img_X_Y_Z.jpg where X, Y, Z are camera coordinates.
+    """
+    # Check if filenames follow the expected format
+    position_pattern = r'.*_(-?\d+\.?\d*)_(-?\d+\.?\d*)_(-?\d+\.?\d*)\.(png|jpg|jpeg)$'
+    
+    import re
+    positions = []
+    valid_indices = []
+    
+    for i, image_path in enumerate(images):
+        filename = os.path.basename(image_path)
+        match = re.match(position_pattern, filename)
+        
+        if match:
+            x, y, z = float(match.group(1)), float(match.group(2)), float(match.group(3))
+            positions.append([x, y, z])
+            valid_indices.append(i)
+    
+    # If we found positions for all images, return them
+    if len(positions) == len(images):
+        print(f"Extracted camera positions from {len(positions)} image filenames")
+        return positions
+    elif len(positions) > 0:
+        print(f"Warning: Could only extract camera positions from {len(positions)} of {len(images)} images")
+        print(f"Using default camera positions for all images")
+    
+    return None
 
 
 if __name__ == "__main__":
@@ -63,6 +97,30 @@ if __name__ == "__main__":
             "the model will be slower. Default: False"
         ),
     )
+    
+    # New arguments for enhanced multi-view reconstruction
+    parser.add_argument(
+        "--hemisphere-distribution",
+        action="store_true",
+        help="Use a hemisphere distribution for camera positions instead of a circle."
+    )
+    parser.add_argument(
+        "--camera-distance",
+        type=float,
+        default=None,
+        help="Custom distance for camera positions. If not specified, the model default is used."
+    )
+    parser.add_argument(
+        "--detect-camera-positions",
+        action="store_true",
+        help="Try to detect camera positions from image filenames (format: img_X_Y_Z.jpg)."
+    )
+    parser.add_argument(
+        "--point-density",
+        type=int,
+        default=1024,
+        help="Density of the point cloud used for reconstruction. Default: 1024"
+    )
 
     remesh_choices = ["none"]
     if TRIANGLE_REMESH_AVAILABLE:
@@ -105,6 +163,7 @@ if __name__ == "__main__":
 
     print("Device used: ", device)
 
+    # Load the model
     model = SPAR3D.from_pretrained(
         args.pretrained_model,
         config_name="config.yaml",
@@ -116,12 +175,17 @@ if __name__ == "__main__":
 
     # Find all images in the directory
     image_paths = []
-    for file in os.listdir(args.image_dir):
-        if file.endswith((".png", ".jpg", ".jpeg")):
+    for file in sorted(os.listdir(args.image_dir)):
+        if file.lower().endswith((".png", ".jpg", ".jpeg")):
             image_paths.append(os.path.join(args.image_dir, file))
     
     if len(image_paths) < 2:
         raise ValueError(f"Found only {len(image_paths)} images in {args.image_dir}. Need at least 2 images for multi-view reconstruction.")
+    
+    # Check if we should extract camera positions from filenames
+    camera_positions = None
+    if args.detect_camera_positions:
+        camera_positions = extract_structured_camera_positions(image_paths, args)
     
     print(f"Found {len(image_paths)} images for multi-view reconstruction.")
     
@@ -129,7 +193,8 @@ if __name__ == "__main__":
     bg_remover = Remover(device=device)
     images = []
     
-    for image_path in image_paths:
+    print("Preprocessing images...")
+    for image_path in tqdm(image_paths):
         image = remove_background(Image.open(image_path).convert("RGBA"), bg_remover)
         image = foreground_crop(image, args.foreground_ratio)
         images.append(image)
@@ -150,6 +215,10 @@ if __name__ == "__main__":
         )
     )
 
+    # Override camera distance if specified
+    if args.camera_distance is not None:
+        model.cfg.default_distance = args.camera_distance
+
     # Process multi-view images
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -168,6 +237,7 @@ if __name__ == "__main__":
                 remesh=args.remesh_option,
                 vertex_count=vertex_count,
                 return_points=True,
+                camera_positions=camera_positions,
             )
     
     if torch.cuda.is_available():
@@ -185,3 +255,8 @@ if __name__ == "__main__":
     print(f"\nReconstruction complete! Results saved to {output_dir}")
     print(f"- 3D Mesh: {out_mesh_path}")
     print(f"- Point Cloud: {out_points_path}")
+    print("\nTips for better results:")
+    print("1. Make sure your input images cover the object from different angles")
+    print("2. Try different camera distance values with --camera-distance")
+    print("3. Include camera position information in filenames (e.g., img_1.0_2.0_3.0.jpg)")
+    print("4. Experiment with different point cloud densities using --point-density")

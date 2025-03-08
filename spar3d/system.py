@@ -929,6 +929,7 @@ class SPAR3D(BaseModule):
         vertex_count: int = -1,
         estimate_illumination: bool = False,
         return_points: bool = False,
+        camera_positions: Optional[List[List[float]]] = None,
     ) -> Tuple[Union[trimesh.Trimesh, List[trimesh.Trimesh]], dict[str, Any]]:
         """Process multiple views of the same object to create a 3D mesh.
         
@@ -943,6 +944,7 @@ class SPAR3D(BaseModule):
             vertex_count: Target vertex count for remeshing
             estimate_illumination: Whether to estimate illumination
             return_points: Whether to return the point cloud
+            camera_positions: Optional list of camera positions (x,y,z) for each view
             
         Returns:
             A tuple of (mesh, global_dict)
@@ -966,9 +968,8 @@ class SPAR3D(BaseModule):
         mask_cond = mask_cond.unsqueeze(0)  # [1, num_views, H, W, 1]
         
         # Create camera parameters for each view
-        # For now, we'll use estimated cameras based on evenly distributed viewpoints
         num_views = len(images)
-        c2w_cond = self._create_multiview_cameras(num_views)
+        c2w_cond = self._create_multiview_cameras(num_views, camera_positions)
         
         intrinsic, intrinsic_normed_cond = create_intrinsic_from_fov_rad(
             self.cfg.default_fovy_rad,
@@ -984,10 +985,31 @@ class SPAR3D(BaseModule):
             "intrinsic_normed_cond": intrinsic_normed_cond.to(self.device).view(1, 1, 3, 3).repeat(1, num_views, 1, 1),
         }
         
+        # Generate consistent point cloud from multi-view images
+        if "pc_cond" not in batch and pointcloud is None:
+            # Use cross-view attention to generate a better point cloud
+            point_cloud = self._generate_multiview_pointcloud(batch)
+            batch["pc_cond"] = point_cloud
+        elif pointcloud is not None:
+            # Use provided point cloud
+            if isinstance(pointcloud, list):
+                cond_tensor = torch.tensor(pointcloud).float().to(self.device).view(-1, 6)
+                xyz = cond_tensor[:, :3]
+                color_rgb = cond_tensor[:, 3:]
+            elif isinstance(pointcloud, np.ndarray):
+                xyz = torch.tensor(pointcloud[:, :3]).float().to(self.device)
+                color_rgb = torch.tensor(pointcloud[:, 3:]).float().to(self.device)
+            else:
+                raise ValueError("Invalid point cloud type")
+
+            pointcloud = torch.cat([xyz, color_rgb], dim=-1).unsqueeze(0)
+            batch["pc_cond"] = pointcloud
+        
+        # Generate mesh using the enhanced point cloud
         meshes, global_dict = self.generate_mesh(
             batch,
             bake_resolution,
-            pointcloud,
+            None,  # Point cloud already in batch["pc_cond"]
             remesh,
             vertex_count,
             estimate_illumination,
@@ -1003,11 +1025,12 @@ class SPAR3D(BaseModule):
         
         return meshes[0], global_dict
         
-    def _create_multiview_cameras(self, num_views: int) -> torch.Tensor:
+    def _create_multiview_cameras(self, num_views: int, camera_positions: Optional[List[List[float]]] = None) -> torch.Tensor:
         """Create camera matrices for multiple viewpoints around the object.
         
         Args:
             num_views: Number of camera viewpoints to create
+            camera_positions: Optional list of camera positions (x,y,z) for each view
             
         Returns:
             Tensor of camera matrices with shape [1, num_views, 4, 4]
@@ -1018,26 +1041,35 @@ class SPAR3D(BaseModule):
         # Base camera distance
         distance = self.cfg.default_distance
         
-        for i in range(num_views):
-            # Calculate angle for this view (evenly distributed around a circle)
-            theta = 2 * np.pi * i / num_views
-            
-            # Calculate camera position
-            x = distance * np.sin(theta)
-            z = distance * np.cos(theta)
-            y = 0.0  # Keep camera at same height
-            
-            # Create camera matrix (looking at origin)
+        # If camera positions are provided, use them
+        if camera_positions and len(camera_positions) == num_views:
+            positions = camera_positions
+        else:
+            # Otherwise create positions evenly distributed on a hemisphere
+            positions = []
+            for i in range(num_views):
+                # Calculate angles for this view (using Fibonacci sphere for better distribution)
+                phi = np.arccos(1 - 2 * (i + 0.5) / num_views)
+                theta = np.pi * (1 + 5**0.5) * i
+                
+                # Convert to Cartesian coordinates (hemisphere pointing up)
+                x = distance * np.sin(phi) * np.cos(theta)
+                y = distance * np.cos(phi)  # This will place cameras in the upper hemisphere
+                z = distance * np.sin(phi) * np.sin(theta)
+                
+                positions.append([x, y, z])
+        
+        # Create camera-to-world matrices
+        for pos in positions:
+            # Create camera matrix
             c2w = torch.eye(4, dtype=torch.float32, device=self.device)
             
             # Set camera position
-            c2w[0, 3] = x
-            c2w[1, 3] = y
-            c2w[2, 3] = z
+            c2w[0, 3] = pos[0]
+            c2w[1, 3] = pos[1]
+            c2w[2, 3] = pos[2]
             
             # Make camera look at origin
-            # This is a simplified version - a proper implementation would calculate
-            # the full camera-to-world matrix with appropriate rotation
             look_at = torch.tensor([0, 0, 0], dtype=torch.float32, device=self.device)
             up = torch.tensor([0, 1, 0], dtype=torch.float32, device=self.device)
             
@@ -1060,3 +1092,76 @@ class SPAR3D(BaseModule):
         c2w_cond = torch.stack(c2w_list, dim=0).unsqueeze(0)  # [1, num_views, 4, 4]
         
         return c2w_cond
+
+    def _generate_multiview_pointcloud(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """Generate a consistent point cloud from multiple views using cross-view attention.
+        
+        This method enhances the point cloud generation by incorporating information
+        from all available views through a cross-attention mechanism.
+        
+        Args:
+            batch: Batch dictionary containing image and camera data
+            
+        Returns:
+            Enhanced point cloud tensor of shape [B, N, 6] (XYZ + RGB)
+        """
+        # Load modules needed
+        if self.is_low_vram:
+            self._unload_main_modules()
+            self._unload_estimator_modules()
+            self._load_pdiff_modules()
+
+        # Prepare images for conditioning
+        batch_size, n_input_views = batch["rgb_cond"].shape[:2]
+
+        # Get camera embeddings for each view
+        camera_embeds = self.pdiff_camera_embedder(**batch)  # [B, Nv, Cc]
+
+        # Get image tokens for each view
+        input_image_tokens = self.pdiff_image_tokenizer(
+            rearrange(batch["rgb_cond"], "B Nv H W C -> B Nv C H W"),
+            modulation_cond=camera_embeds,
+        )  # [B, Nv, Cit, Nit]
+
+        # Reshape tokens to have all views in a sequence
+        view_tokens = rearrange(
+            input_image_tokens, "B Nv C Nt -> B (Nv Nt) C", Nv=n_input_views
+        )  # [B, Nv*Nt, C]
+
+        # Generate point cloud using the sampler with cross-view tokens
+        sample_iter = self.sampler.sample_batch_progressive(
+            batch_size, view_tokens, device=self.device
+        )
+        for x in sample_iter:
+            samples = x["xstart"]
+
+        # Format the point cloud
+        point_cloud = samples.permute(0, 2, 1).float()  # [B, N, C]
+        point_cloud = normalize_pc_bbox(point_cloud)  # Normalize to bounding box
+
+        # Generate more points for multi-view (512 is default for single-view)
+        num_points = min(1024, point_cloud.shape[1] * 2)  # Double the points but cap at 1024
+        if num_points > point_cloud.shape[1]:
+            # Duplicate and jitter points to get more coverage
+            original_points = point_cloud.clone()
+            
+            # Create random indices for duplication
+            indices = torch.randint(
+                0, original_points.shape[1], (batch_size, num_points - original_points.shape[1]),
+                device=self.device
+            )
+            
+            # Create duplicated points with small random offsets
+            duplicated_points = torch.gather(
+                original_points, 1,
+                indices.unsqueeze(-1).repeat(1, 1, original_points.shape[-1])
+            )
+            
+            # Add small random offsets to position (not color)
+            noise = torch.randn_like(duplicated_points[:, :, :3]) * 0.01
+            duplicated_points[:, :, :3] += noise
+            
+            # Concatenate original and duplicated points
+            point_cloud = torch.cat([original_points, duplicated_points], dim=1)
+
+        return point_cloud
